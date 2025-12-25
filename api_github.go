@@ -31,8 +31,9 @@ func fetchGithub() tea.Msg {
 		return githubMsg{status: "No User"}
 	}
 
-	// Fetch events
-	req, _ := http.NewRequest("GET", fmt.Sprintf("https://api.github.com/users/%s/events?per_page=100", username), nil)
+	// 1. Fetch Events
+	url := fmt.Sprintf("https://api.github.com/users/%s/events?per_page=100", username)
+	req, _ := http.NewRequest("GET", url, nil)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -48,13 +49,15 @@ func fetchGithub() tea.Msg {
 		return githubMsg{status: fmt.Sprintf("Err %d", resp.StatusCode)}
 	}
 
-	// Data structures
+	// Data Structures
 	type Commit struct {
 		Message string `json:"message"`
 	}
 	type Payload struct {
 		Action      string `json:"action"`
 		Size        int    `json:"size"`
+		Ref         string `json:"ref"`
+		Head        string `json:"head"`
 		PullRequest struct {
 			Merged bool `json:"merged"`
 		} `json:"pull_request"`
@@ -72,56 +75,56 @@ func fetchGithub() tea.Msg {
 		return githubMsg{status: "Json Err"}
 	}
 
-	// Stats Calculation
+	// 2. Process
 	todayLocal := time.Now().Format("2006-01-02")
 	c, p, i := 0, 0, 0
 	var latest []string
 
 	for _, e := range events {
-		// Convert event UTC time to Local System Time
-		eventLocalTime := e.CreatedAt.In(time.Local)
-		dateStr := eventLocalTime.Format("2006-01-02")
+		dateStr := e.CreatedAt.In(time.Local).Format("2006-01-02")
 
-		// 1. Latest Activity Logic
-		// We want to list individual commits, not just "Push Event"
-		if e.Type == "PushEvent" && len(latest) < 4 {
-			// Use FULL Repo Name (e.g. "owner/repo")
-			rName := e.Repo.Name
-
-			commits := e.Payload.Commits
-			if commits != nil && len(commits) > 0 {
-				// Iterate backwards to get the most recent commit in the batch first
-				for k := len(commits) - 1; k >= 0; k-- {
-					if len(latest) >= 4 {
-						break
-					}
-
-					// Clean up message (take first line, truncate)
-					msg := strings.Split(commits[k].Message, "\n")[0]
-					if len(msg) > 30 {
-						msg = msg[:27] + "..."
-					}
-
-					latest = append(latest, fmt.Sprintf("• %s: %s", rName, msg))
-				}
-			}
-		}
-
-		// 2. Today's Stats Logic
+		// --- STRICT FILTER: ONLY TODAY ---
 		if dateStr != todayLocal {
 			continue
 		}
 
+		// --- Latest Activity List (Push Only) ---
+		if e.Type == "PushEvent" && len(latest) < 4 {
+			rName := e.Repo.Name
+
+			// Case A: Payload has commits
+			if len(e.Payload.Commits) > 0 {
+				for k := len(e.Payload.Commits) - 1; k >= 0; k-- {
+					if len(latest) >= 4 {
+						break
+					}
+					msg := formatMessage(e.Payload.Commits[k].Message)
+					latest = append(latest, fmt.Sprintf("• %s: %s", rName, msg))
+				}
+			} else {
+				// Case B: Payload empty (Branch update/Merge), fetch manually
+				msg := "Pushed update"
+				if e.Payload.Head != "" && token != "" {
+					fetchedMsg := fetchSingleCommitMessage(e.Repo.Name, e.Payload.Head, token)
+					if fetchedMsg != "" {
+						msg = fetchedMsg
+					} else if e.Payload.Ref != "" {
+						branch := strings.Replace(e.Payload.Ref, "refs/heads/", "", 1)
+						msg = fmt.Sprintf("Pushed to %s", branch)
+					}
+				}
+				latest = append(latest, fmt.Sprintf("• %s: %s", rName, msg))
+			}
+		}
+
+		// --- Stats Counters ---
 		switch e.Type {
 		case "PushEvent":
-			// STRICT COUNT: Use the payload size (number of commits in the push).
-			// If size is missing but commits array exists, use that length.
 			count := e.Payload.Size
-			if count == 0 && len(e.Payload.Commits) > 0 {
-				count = len(e.Payload.Commits)
-			}
+			if count == 0 {
+				count = 1
+			} // Force count 1
 			c += count
-
 		case "PullRequestEvent":
 			if e.Payload.Action == "closed" && e.Payload.PullRequest.Merged {
 				p++
@@ -134,4 +137,44 @@ func fetchGithub() tea.Msg {
 	}
 
 	return githubMsg{commits: c, prs: p, issues: i, latest: latest}
+}
+
+// Helper to clean up commit messages
+func formatMessage(raw string) string {
+	lines := strings.Split(raw, "\n")
+	msg := lines[0]
+	if len(msg) > 30 {
+		msg = msg[:27] + "..."
+	}
+	return msg
+}
+
+// Helper to fetch a specific commit message
+func fetchSingleCommitMessage(repoFull string, sha string, token string) string {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/commits/%s", repoFull, sha)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return ""
+	}
+
+	var commitData struct {
+		Commit struct {
+			Message string `json:"message"`
+		} `json:"commit"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&commitData); err != nil {
+		return ""
+	}
+
+	return formatMessage(commitData.Commit.Message)
 }
